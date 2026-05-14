@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="description" content="INSCONE: Unknown-Aware Detection of LLM-Generated Text via Informed Wild Data">
+<title>INSCONE</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,wght@0,300;0,400;0,600;1,300;1,400&family=JetBrains+Mono:wght@400;500&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+<style>
+  :root {
+    --bg: #faf9f7;
+    --text: #1a1a1a;
+    --muted: #6b6b6b;
+    --accent: #c0392b;
+    --accent-light: #f5e6e4;
+    --border: #e2ddd8;
+    --code-bg: #f0ede8;
+    --serif: 'Source Serif 4', Georgia, serif;
+    --sans: 'DM Sans', sans-serif;
+    --mono: 'JetBrains Mono', monospace;
+    --max: 860px;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--serif);
+    font-size: 18px;
+    line-height: 1.75;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ── header ── */
+  header {
+    border-bottom: 1px solid var(--border);
+    padding: 72px 24px 56px;
+    text-align: center;
+  }
+
+  .venue {
+    font-family: var(--sans);
+    font-size: 13px;
+    font-weight: 500;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 20px;
+  }
+
+  h1 {
+    font-family: var(--serif);
+    font-size: clamp(28px, 4vw, 46px);
+    font-weight: 600;
+    line-height: 1.2;
+    max-width: 760px;
+    margin: 0 auto 12px;
+  }
+
+  .subtitle {
+    font-family: var(--sans);
+    font-size: 16px;
+    color: var(--muted);
+    font-style: italic;
+    margin-bottom: 36px;
+  }
+
+  .authors {
+    font-family: var(--sans);
+    font-size: 15px;
+    color: var(--muted);
+    margin-bottom: 8px;
+    line-height: 2;
+  }
+
+  .authors a {
+    color: var(--text);
+    text-decoration: none;
+    border-bottom: 1px solid var(--border);
+    transition: border-color 0.2s;
+  }
+  .authors a:hover { border-color: var(--accent); color: var(--accent); }
+
+  .affiliation {
+    font-family: var(--sans);
+    font-size: 13px;
+    color: var(--muted);
+    margin-bottom: 36px;
+  }
+
+  .links {
+    display: flex;
+    gap: 12px;
+    justify-content: center;
+    flex-wrap: wrap;
+  }
+
+  .link-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 8px 18px;
+    font-family: var(--sans);
+    font-size: 13px;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+    text-decoration: none;
+    border-radius: 2px;
+    transition: all 0.15s;
+    border: 1px solid var(--text);
+    color: var(--text);
+    background: transparent;
+  }
+  .link-btn:hover {
+    background: var(--text);
+    color: var(--bg);
+  }
+  .link-btn.primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: white;
+  }
+  .link-btn.primary:hover {
+    background: #a93226;
+    border-color: #a93226;
+  }
+
+  /* ── teaser ── */
+  .teaser {
+    max-width: var(--max);
+    margin: 0 auto;
+    padding: 56px 24px 0;
+    text-align: center;
+  }
+
+  .teaser img {
+    width: 100%;
+    border: 1px solid var(--border);
+    border-radius: 2px;
+  }
+
+  .teaser-caption {
+    font-family: var(--sans);
+    font-size: 13px;
+    color: var(--muted);
+    margin-top: 12px;
+    line-height: 1.5;
+  }
+
+  /* ── main content ── */
+  main {
+    max-width: var(--max);
+    margin: 0 auto;
+    padding: 56px 24px 80px;
+  }
+
+  section { margin-bottom: 64px; }
+
+  h2 {
+    font-family: var(--serif);
+    font-size: 22px;
+    font-weight: 600;
+    margin-bottom: 20px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  h3 {
+    font-family: var(--sans);
+    font-size: 15px;
+    font-weight: 500;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 32px 0 12px;
+  }
+
+  p { margin-bottom: 16px; }
+  p:last-child { margin-bottom: 0; }
+
+  /* ── abstract box ── */
+  .abstract-box {
+    background: white;
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    padding: 28px 32px;
+    font-size: 17px;
+    line-height: 1.8;
+  }
+
+  /* ── method figure ── */
+  .figure {
+    margin: 32px 0;
+    text-align: center;
+  }
+
+  .figure img {
+    width: 100%;
+    border: 1px solid var(--border);
+    border-radius: 2px;
+  }
+
+  .figure-caption {
+    font-family: var(--sans);
+    font-size: 13px;
+    color: var(--muted);
+    margin-top: 10px;
+    line-height: 1.5;
+    text-align: left;
+  }
+
+  .figure-caption strong {
+    color: var(--text);
+    font-weight: 500;
+  }
+
+  /* ── two-col layout ── */
+  .two-col {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 24px;
+    margin: 24px 0;
+  }
+
+  @media (max-width: 640px) {
+    .two-col { grid-template-columns: 1fr; }
+  }
+
+  .two-col .figure { margin: 0; }
+
+  /* ── tables ── */
+  .table-wrap {
+    overflow-x: auto;
+    margin: 24px 0;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: var(--sans);
+    font-size: 14px;
+  }
+
+  thead tr {
+    border-bottom: 2px solid var(--text);
+  }
+
+  th {
+    padding: 10px 14px;
+    text-align: left;
+    font-weight: 500;
+    font-size: 13px;
+    letter-spacing: 0.03em;
+  }
+
+  td {
+    padding: 9px 14px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  tr:last-child td { border-bottom: none; }
+
+  .best { font-weight: 600; color: var(--accent); }
+
+  tr.highlight { background: var(--accent-light); }
+
+  .table-caption {
+    font-family: var(--sans);
+    font-size: 13px;
+    color: var(--muted);
+    margin-top: 10px;
+    line-height: 1.5;
+  }
+
+  /* ── inline math placeholder ── */
+  .math { font-family: var(--mono); font-size: 14px; }
+
+  /* ── insight cards ── */
+  .insights {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin: 24px 0;
+  }
+
+    .insights-energy {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 16px;
+    margin: 24px 0;
+  }
+
+  @media (max-width: 600px) {
+    .insights { grid-template-columns: 1fr; }
+  }
+
+  .insight-card {
+    background: white;
+    border: 1px solid var(--border);
+    padding: 20px 24px;
+  }
+
+  .insight-card .icon {
+    font-size: 20px;
+    margin-bottom: 8px;
+  }
+
+  .insight-card h4 {
+    font-family: var(--sans);
+    font-size: 14px;
+    font-weight: 500;
+    margin-bottom: 6px;
+  }
+
+  .insight-card p {
+    font-family: var(--sans);
+    font-size: 13px;
+    color: var(--muted);
+    line-height: 1.6;
+    margin: 0;
+  }
+
+  /* ── bibtex ── */
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    padding: 20px 24px;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    line-height: 1.7;
+    overflow-x: auto;
+    border-radius: 2px;
+  }
+
+  /* ── footer ── */
+  footer {
+    border-top: 1px solid var(--border);
+    padding: 32px 24px;
+    text-align: center;
+    font-family: var(--sans);
+    font-size: 12px;
+    color: var(--muted);
+  }
+
+  footer a { color: var(--muted); }
+
+  /* ── scroll reveal ── */
+  .reveal {
+    opacity: 0;
+    transform: translateY(16px);
+    transition: opacity 0.5s ease, transform 0.5s ease;
+  }
+  .reveal.visible {
+    opacity: 1;
+    transform: none;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="venue">CS639 · University of Wisconsin–Madison · 2026</div>
+  <h1>INSCONE: Unknown-Aware Detection of LLM-Generated Text via Informed Wild Data</h1>
+  <p class="subtitle">Informed SCONE for zero-shot generalization to unseen LLM families</p>
+
+  <div class="authors">
+    <a href="https://markstanl.com" target="_blank">Mark Stanley</a>,
+    <a href="https://www.linkedin.com/in/masaabboud/" target="_blank">Masa Abboud</a>,
+    <a href="https://www.linkedin.com/in/saira-khatoon-76932a271/" target="_blank">Saira Khatoon</a>,
+    <a href="https://github.com/fairozkhan10" target="_blank">Fairoz Khan</a>,
+        <a href="https://www.linkedin.com/in/samad-syed/" target="_blank">Samad Syed</a>
+  </div>
+  <div class="affiliation">University of Wisconsin–Madison</div>
+
+  <div class="links">
+    <a class="link-btn primary" href="/assets/INSCONE_v1.pdf">
+      <i class="fa-solid fa-file-pdf"></i> Paper
+    </a>
+    <a class="link-btn" href="https://github.com/markstanl/INSCONE">
+      <i class="fa-brands fa-github"></i> Code
+    </a>
+    <a class="link-btn" href="https://huggingface.co/datasets/markstanl/RAID-Plus">
+      <i class="fa-solid fa-database"></i> RAID+
+    </a>
+  </div>
+</header>
+
+<div class="teaser reveal">
+  <div style="max-width: var(--max); margin: 0 auto; padding: 56px 24px 0;">
+    <img src="assets/data.png" alt="Energy distributions by split">
+    <p class="teaser-caption">Energy distributions under the trained baseline. ID and covariate LLMs cluster at low energy; human text sits near the OOD margin. Zero-shot unseen models track the covariate seen distribution — the geometry INSCONE exploits.</p>
+  </div>
+</div>
+
+<main>
+
+  <!-- Abstract -->
+  <section class="reveal">
+    <h2>Abstract</h2>
+    <div class="abstract-box">
+      <p>AI-generated text is increasingly difficult to distinguish from human writing, creating risks in academic integrity, medical misinformation, and social media disinformation. While recent work has reframed MGT detection as an out-of-distribution problem with strong in-distribution and zero-shot results, generalization to LLMs unseen during training remains underexplored.</p>
+      <p>We propose <strong>INSCONE</strong> (<strong>In</strong>formed <strong>SCONE</strong>), which adapts the SCONE wild-data framework to the text domain by exploiting curated wild data with known mixing proportions (π<sub>id</sub>, π<sub>c</sub>, π<sub>s</sub>) to stabilize the energy geometry around seen and unseen LLM families. INSCONE achieves a <strong>6.1-point FPR95 improvement</strong> over a competitive baseline on the RAID benchmark. We additionally release <strong>RAID+</strong>, an extended evaluation set regenerating RAID prompts with contemporary frontier models.</p>
+      <p style="margin-top: 12px; font-family: var(--sans); font-size: 13px; color: var(--muted);">
+        Code and data: <a href="https://github.com/markstanl/INSCONE" style="color: var(--accent);">github.com/markstanl/INSCONE</a> · <a href="https://huggingface.co/datasets/markstanl/RAID-Plus" style="color: var(--accent);">huggingface.co/datasets/markstanl/RAID-Plus</a>
+      </p>
+    </div>
+  </section>
+
+  <!-- Key insight -->
+  <section class="reveal">
+    <h2>Key Insight</h2>
+    <p>Standard SCONE uniformly pushes all wild samples toward high energy. This is a reasonable assumption in vision where covariate shift is pixel-level. In text, covariate shift means an entirely different model family. The push term overwhelms the Lipschitz drag and incorrectly drives unseen LLM embeddings toward the human text region.</p>
+
+    <div class="insights">
+      <div class="insight-card">
+        <div class="icon">⬅️</div>
+        <h4>Proximal anchor</h4>
+        <p>Wild samples below the quantile threshold τ<sub>prox</sub> are estimated as covariate OOD and pulled toward low energy, anchoring unseen LLMs near the ID region.</p>
+      </div>
+      <div class="insight-card">
+        <div class="icon">➡️</div>
+        <h4>Distal anchor</h4>
+        <p>Wild samples above τ<sub>dist</sub> are estimated as semantic OOD (human text) and pushed toward high energy. A buffer δ around the boundary receives no gradient.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Method -->
+<section class="reveal">
+  <h2>Method</h2>
+
+  <h3>Energy-Based Baseline</h3>
+  <p>We build on HTAO's energy-based detector, which uses a frozen SimCSE-RoBERTa encoder to map text into an embedding space where LLM-generated text clusters tightly at low energy and human text diffuses toward high energy. A lightweight classification head over known LLM families sharpens this geometry during training.</p>
+
+  <h3>INSCONE Wild Loss</h3>
+  <p>INSCONE instead utilizes the known composition of the wild batch to split samples into two groups: those likely to be machine-generated (pulled toward low energy) and those likely to be human (pushed toward high energy). A small tunable buffer around the boundary receives no gradient, preventing noisy updates from ambiguous samples.</p>
+
+  <div class="figure">
+    <img src="assets/wild_energies.png" alt="Wild energy quantile curve">
+    <p class="figure-caption"><strong>Empirical wild batch energy distribution.</strong> Wild ratios set to 10% ID, 60% OOD Covariate, and 30% OOD Semantic. Green = proximal (covariate) region anchored at low energy; red = distal (human) region pushed high; gray = buffer receiving no gradient. ~99.2% of proximal samples are machine text; ~99.6% of distal samples are human.</p>
+  </div>
+
+  <div class="insights-energy">
+    <div class="insight-card">
+      <h4>Proximal region</h4>
+      <p>The lowest-energy wild samples are estimated as covariate OOD (unseen LLMs) and pulled toward the ID energy region.</p>
+    </div>
+    <div class="insight-card">
+      <h4>Distal region</h4>
+      <p>The highest-energy wild samples are estimated as human text and pushed further toward high energy.</p>
+    </div>
+    <div class="insight-card">
+      <h4>Dead zone</h4>
+      <p>Samples near the composition boundary receive no gradient — preventing spurious updates from ambiguous wild samples.</p>
+    </div>
+  </div>
+</section>
+
+  <!-- Results -->
+  <section class="reveal">
+    <h2>Results</h2>
+    <p>Evaluated on RAID temporal split.</p>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Method</th>
+            <th>AUROC ↑</th>
+            <th>Wild FPR95 ↓</th>
+            <th>Zero-Shot FPR95 ↓</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Standard SCONE</td>
+            <td>0.9298</td>
+            <td>0.4702</td>
+            <td>0.4486</td>
+          </tr>
+          <tr>
+            <td>Fair Ablation (20k labeled)</td>
+            <td>0.9371</td>
+            <td>0.1552</td>
+            <td>0.3166</td>
+          </tr>
+          <tr>
+            <td>Baseline (10k)</td>
+            <td>0.9520</td>
+            <td>0.1646</td>
+            <td>0.2862</td>
+          </tr>
+          <tr class="highlight">
+            <td><strong>INSCONE (ours)</strong></td>
+            <td>0.9506</td>
+            <td>0.1764</td>
+            <td class="best">0.2252</td>
+          </tr>
+        </tbody>
+      </table>
+      <p class="table-caption">INSCONE achieves the best zero-shot FPR95, improving <strong>6.1 points</strong> over the naive baseline and <strong>20.3 points</strong> over standard SCONE, at near-identical AUROC.</p>
+    </div>
+
+  <!-- RAID+ -->
+  <section class="reveal">
+    <h2>RAID+ Dataset</h2>
+    <p>We regenerate RAID prompts using frontier models absent from the original benchmark, providing an evaluation set for testing detector behavior against unseen contemporary LLMs not present in any existing MGT benchmark.</p>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Model</th><th>Samples</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Gemini-3.1-Pro</td><td>2,000</td></tr>
+          <tr><td>DeepSeek-V3</td><td>2,000</td></tr>
+          <tr><td>Gemma-3-27B</td><td>2,000</td></tr>
+          <tr><td>LLaMA-3.3-70B</td><td>2,000</td></tr>
+          <tr><td><strong>Total</strong></td><td><strong>8,000</strong>
+        </tbody>
+      </table>
+    </div>
+
+    <p>Available on 🤗 at <a href="https://huggingface.co/datasets/markstanl/RAID-Plus" style="color: var(--accent);">markstanl/RAID-Plus</a>.</p>
+  </section>
+
+  <!-- BibTeX -->
+  <section class="reveal">
+    <h2>BibTeX</h2>
+<pre>@misc{stanley2025inscone,
+  title   = {INSCONE: Unknown-Aware Detection of LLM-Generated Text
+             via Informed Wild Data},
+  author  = {Stanley, Mark and Abboud, Masa and Khan, Fairoz and
+             Khatoon, Saira and Syed, Samad},
+  year    = {2025},
+  url     = {https://github.com/markstanl/INSCONE}
+}</pre>
+  </section>
+
+</main>
+
+<footer>
+  <p>University of Wisconsin–Madison · CS639 · 2025 &nbsp;·&nbsp; Website template inspired by <a href="https://nerfies.github.io">Nerfies</a></p>
+</footer>
+
+<script>
+  const observer = new IntersectionObserver(
+    entries => entries.forEach(e => { if (e.isIntersecting) e.target.classList.add('visible'); }),
+    { threshold: 0.1 }
+  );
+  document.querySelectorAll('.reveal').forEach(el => observer.observe(el));
+</script>
+</body>
+</html>
