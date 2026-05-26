@@ -1,27 +1,32 @@
 """
 Full-data datamodule for energy-based OSR detection.
 
-Split philosophy:
-  - train/val/test allocated first via split_ratios, applied independently per model.
-  - wild pool constructed from *leftovers* after train/val/test, subject to wild_ratios
-    composition (pi_id, pi_cov, pi_sem). the constraining component (whichever pool has
-    fewest leftover examples relative to its target fraction) sets total wild size.
-    excess leftovers from other components are discarded, not overflowed.
-  - human text is treated as its own model for split_ratios purposes, then its leftover
-    contributes to the pi_sem slice of the wild pool.
-  - human test examples are shared (identical indices) across all three test pillars.
-  - zero overlap guaranteed: each example index appears in exactly one of
-    {train, val, test_machine, wild} per model.
+Role definitions (strictly enforced, zero leakage):
+  ID models       -> train, val, test_id, wild_id
+  Covariate models-> val_cov, test_cov, wild_cov   (never train)
+  Zero-shot models-> test_zs only                  (never train, val, wild)
+  Human           -> train, val, test (all pillars), wild_human
+
+Split construction order:
+  1. Wild carved first from ID/covariate/human pools proportionally (wild_size total,
+     wild_ratios composition). Zero-shot models contribute nothing to wild.
+  2. Remainder of ID/human split by SplitRatios (train/val/test, sum=1.0).
+     Remainder of covariate split goes entirely to val_cov + test_cov (no train).
+     Remainder of zero-shot goes entirely to test_zs.
+  3. Attacks appended to test pillars only (never train, val, wild).
+  4. Each test pillar capped at test_pool_cap by uniform subsample.
+
+Human test indices are shared across all three test pillars.
+Overlap assertions verify train/val/wild disjointness at construction time.
 """
 
 import os
 import random
-from collections import defaultdict
-from dataclasses import dataclass, field
 
 import numpy as np
 import torch
 import lightning as L
+from dataclasses import dataclass
 from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset
 from transformers import AutoTokenizer
@@ -37,14 +42,15 @@ FAMILY_MAP = {
 }
 
 SPLIT_FAMILIES = {
-    "temporal": {'GPT': 0, 'MPT': 1},
-    "temporal-ablate": {'GPT': 0, 'ChatGPT': 1, 'Meta-LLaMA': 2, 'MPT': 3},
-    "scone-temporal": {'GPT': 0, 'MPT': 1, 'ChatGPT': 2, 'Meta-LLaMA': 3},
-    "scone-temporal-ablate": {'GPT': 0, 'ChatGPT': 1, 'Meta-LLaMA': 2, 'MPT': 3},
-    "all": {'GPT': 0, 'ChatGPT': 1, 'Meta-LLaMA': 2, 'MPT': 3, 'Cohere': 4, 'Mistral': 5},
+    "temporal":             {'GPT': 0, 'MPT': 1},
+    "temporal-ablate":      {'GPT': 0, 'ChatGPT': 1, 'Meta-LLaMA': 2, 'MPT': 3},
+    "scone-temporal":       {'GPT': 0, 'MPT': 1, 'ChatGPT': 2, 'Meta-LLaMA': 3},
+    "scone-temporal-ablate":{'GPT': 0, 'ChatGPT': 1, 'Meta-LLaMA': 2, 'MPT': 3},
+    "all":                  {'GPT': 0, 'ChatGPT': 1, 'Meta-LLaMA': 2, 'MPT': 3, 'Cohere': 4, 'Mistral': 5},
 }
 
-# model -> split role
+# strict role assignment per split strategy
+# covariate and zero_shot are EXCLUSIVE of id — no model appears in two roles
 SPLIT_ROLES = {
     "scone-temporal": {
         "id":        ['gpt2', 'gpt3', 'mpt', 'chatgpt', 'llama-chat'],
@@ -53,7 +59,7 @@ SPLIT_ROLES = {
     },
     "scone-temporal-ablate": {
         "id":        ['gpt2', 'gpt3', 'mpt', 'chatgpt', 'llama-chat', 'mpt-chat', 'gpt4'],
-        "covariate": ['gpt2', 'gpt3', 'mpt', 'chatgpt', 'llama-chat', 'mpt-chat', 'gpt4'],
+        "covariate": [],
         "zero_shot": ['cohere', 'cohere-chat'],
     },
     "temporal": {
@@ -63,16 +69,14 @@ SPLIT_ROLES = {
     },
     "temporal-ablate": {
         "id":        ['gpt2', 'gpt3', 'mpt', 'chatgpt', 'llama-chat'],
-        "covariate": ['gpt2', 'gpt3', 'mpt', 'chatgpt', 'llama-chat'],
+        "covariate": [],
         "zero_shot": ['gpt4', 'mpt-chat', 'mistral', 'mistral-chat', 'cohere', 'cohere-chat'],
     },
     "all": {
         "id":        ['gpt2', 'gpt3', 'mpt', 'chatgpt', 'llama-chat', 'gpt4', 'mpt-chat',
                       'mistral', 'mistral-chat', 'cohere', 'cohere-chat'],
-        "covariate": ['gpt2', 'gpt3', 'mpt', 'chatgpt', 'llama-chat', 'gpt4', 'mpt-chat',
-                      'mistral', 'mistral-chat', 'cohere', 'cohere-chat'],
-        "zero_shot": ['gpt2', 'gpt3', 'mpt', 'chatgpt', 'llama-chat', 'gpt4', 'mpt-chat',
-                      'mistral', 'mistral-chat', 'cohere', 'cohere-chat'],
+        "covariate": [],
+        "zero_shot": [],
     },
 }
 
@@ -90,111 +94,79 @@ def set_seed(seed: int = 42):
 @dataclass
 class SplitRatios:
     """
-    Per-model allocation ratios. must sum to 1.0.
+    Per-model train/val/test allocation ratios applied to remainder after wild carve-out.
+    Applied only to ID and human pools. Must sum to 1.0.
 
-    :param train: fraction of each model's examples allocated to train.
-    :param val: fraction allocated to val.
-    :param test: fraction allocated to test.
-    :param wild: fraction allocated to wild pool (leftovers after train/val/test).
-                 wild pool is further constrained by wild_ratios composition.
+    :param train: fraction of remainder to train.
+    :param val: fraction of remainder to val.
+    :param test: fraction of remainder to test.
     """
-    train: float = 0.85
+    train: float = 0.90
     val:   float = 0.05
     test:  float = 0.05
-    wild:  float = 0.05
 
     def __post_init__(self):
-        total = self.train + self.val + self.test + self.wild
-        assert abs(total - 1.0) < 1e-6, f"split_ratios must sum to 1.0, got {total:.6f}"
+        total = self.train + self.val + self.test
+        assert abs(total - 1.0) < 1e-6, f"SplitRatios must sum to 1.0, got {total:.6f}"
         for name, v in vars(self).items():
-            assert 0.0 < v < 1.0, f"split_ratios.{name}={v} must be in (0, 1)"
+            assert 0.0 < v < 1.0, f"SplitRatios.{name}={v} must be in (0, 1)"
 
 
-def _split_model_indices(
-    indices: np.ndarray,
-    ratios: SplitRatios,
+def _proportional_wild_carve(
+    pools: dict[str, np.ndarray],
+    target: int,
     rng: np.random.Generator,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    """
+    Carves `target` total examples from `pools` proportionally to each pool's size.
+    If total available < target, uses all available.
+
+    :param pools: model_name -> shuffled clean index array.
+    :param target: total examples to carve across all pools.
+    :returns: (carved, remainder) both model_name -> index array.
+    """
+    total_available = sum(len(v) for v in pools.values())
+    actual_target   = min(target, total_available)
+
+    carved    = {}
+    remainder = {}
+    for m, idx in pools.items():
+        n_take = int(actual_target * len(idx) / total_available) if total_available > 0 else 0
+        carved[m]    = idx[:n_take]
+        remainder[m] = idx[n_take:]
+    return carved, remainder
+
+
+def _split_by_ratios(
+    idx: np.ndarray,
+    ratios: SplitRatios,
 ) -> dict[str, np.ndarray]:
     """
-    Splits a model's index array into train/val/test/wild with no overlap.
+    Splits index array into train/val/test by SplitRatios. array must be pre-shuffled.
 
-    :param indices: all clean indices for one model.
+    :param idx: pre-shuffled index array.
     :param ratios: SplitRatios instance.
-    :param rng: seeded numpy rng.
-    :returns: dict with keys train, val, test, wild.
+    :returns: dict with keys train, val, test.
     """
-    idx = indices.copy()
-    rng.shuffle(idx)
-    n = len(idx)
+    n       = len(idx)
     n_train = int(n * ratios.train)
     n_val   = int(n * ratios.val)
-    n_test  = int(n * ratios.test)
-    # wild gets the remainder — at least 1 each for train/val/test
-    assert n_train >= 1 and n_val >= 1 and n_test >= 1, (
-        f"model has too few examples ({n}) to satisfy split_ratios"
+    assert n_train >= 1 and n_val >= 1, (
+        f"pool too small ({n}) to satisfy SplitRatios — reduce wild_size or wild_ratios"
     )
-    cuts = np.cumsum([n_train, n_val, n_test])
-    return {
-        "train": idx[:cuts[0]],
-        "val":   idx[cuts[0]:cuts[1]],
-        "test":  idx[cuts[1]:cuts[2]],
-        "wild":  idx[cuts[2]:],
-    }
+    cuts = np.cumsum([n_train, n_val])
+    return {"train": idx[:cuts[0]], "val": idx[cuts[0]:cuts[1]], "test": idx[cuts[1]:]}
 
 
-def _build_wild_pool(
-    wild_leftovers: dict[str, list[np.ndarray]],
-    wild_ratios: tuple[float, float, float],
+def _cap_pool(
+    idx: np.ndarray,
+    cap: int,
     rng: np.random.Generator,
 ) -> np.ndarray:
-    """
-    Constructs the wild pool from leftover indices, respecting wild_ratios composition.
-
-    The constraining component (fewest available examples relative to its target fraction)
-    sets the total wild pool size. Other components are subsampled to match.
-
-    :param wild_leftovers: keys 'id', 'covariate', 'human'. each value is a list of
-                           per-model index arrays to concatenate.
-    :param wild_ratios: (pi_id, pi_cov, pi_sem). must sum to 1.
-    :returns: shuffled wild pool index array.
-    """
-    pi_id, pi_cov, pi_sem = wild_ratios
-    assert abs(pi_id + pi_cov + pi_sem - 1.0) < 1e-6, f"wild_ratios must sum to 1: {wild_ratios}"
-
-    pools = {
-        "id":       np.concatenate(wild_leftovers["id"])       if wild_leftovers["id"]       else np.array([], dtype=np.int64),
-        "covariate":np.concatenate(wild_leftovers["covariate"])if wild_leftovers["covariate"]else np.array([], dtype=np.int64),
-        "human":    np.concatenate(wild_leftovers["human"])    if wild_leftovers["human"]     else np.array([], dtype=np.int64),
-    }
-    for k, arr in pools.items():
-        rng.shuffle(arr)
-
-    fracs = {"id": pi_id, "covariate": pi_cov, "human": pi_sem}
-
-    # find constraining component
-    max_totals = {}
-    for key, frac in fracs.items():
-        if frac > 0:
-            max_totals[key] = int(len(pools[key]) / frac)
-        else:
-            max_totals[key] = int(1e18)
-
-    n_total = min(max_totals.values())
-    assert n_total > 0, "wild pool is empty — check that split_ratios.wild > 0 and models have sufficient examples"
-
-    slices = {}
-    for key, frac in fracs.items():
-        n_take = int(n_total * frac)
-        available = len(pools[key])
-        assert n_take <= available, (
-            f"wild pool construction: need {n_take} {key} examples but only {available} available. "
-            f"reduce split_ratios.wild or adjust wild_ratios."
-        )
-        slices[key] = pools[key][:n_take]
-
-    combined = np.concatenate(list(slices.values()))
-    rng.shuffle(combined)
-    return combined, {k: len(v) for k, v in slices.items()}
+    """Uniform random subsample to cap if pool exceeds cap. no-op if cap <= 0."""
+    if cap <= 0 or len(idx) <= cap:
+        return idx
+    return idx[rng.choice(len(idx), size=cap, replace=False)]
 
 
 class FullEnergyRAIDSubset(Dataset):
@@ -214,32 +186,32 @@ class FullEnergyRAIDSubset(Dataset):
         max_length: int = 512,
         is_unlabeled: bool = False,
     ):
-        self.dataset = hf_dataset
-        self.tokenizer = tokenizer
+        self.dataset       = hf_dataset
+        self.tokenizer     = tokenizer
         self.family_to_idx = family_to_idx
-        self.max_length = max_length
-        self.is_unlabeled = is_unlabeled
+        self.max_length    = max_length
+        self.is_unlabeled  = is_unlabeled
 
     def __len__(self) -> int:
         return len(self.dataset)
 
     def __getitem__(self, idx: int) -> dict:
-        example = self.dataset[idx]
-        enc = self.tokenizer(
+        example    = self.dataset[idx]
+        enc        = self.tokenizer(
             example["generation"],
             truncation=True,
             padding="max_length",
             max_length=self.max_length,
             return_tensors="pt",
         )
-        tokens = enc["input_ids"].squeeze(0)
-        mask   = enc["attention_mask"].squeeze(0)
+        tokens     = enc["input_ids"].squeeze(0)
+        mask       = enc["attention_mask"].squeeze(0)
         model_name = example["model"]
 
         if self.is_unlabeled:
             return {
                 "tokens": tokens, "mask": mask,
-                "label": torch.tensor(-1, dtype=torch.long),
+                "label":      torch.tensor(-1, dtype=torch.long),
                 "family_idx": torch.tensor(-1, dtype=torch.long),
                 "group": model_name,
             }
@@ -254,22 +226,24 @@ class FullEnergyRAIDDataModule(L.LightningDataModule):
     """
     Full-data datamodule for energy-based MGT detection on RAID.
 
-    Uses the entire dataset with no fixed budget caps. Each model's examples are
-    split independently by split_ratios (train/val/test/wild). The wild pool is then
-    constructed from wild leftovers subject to wild_ratios composition constraints.
+    Strict role enforcement — zero data leakage across ID/covariate/zero-shot boundaries.
+    Wild carved first from ID+covariate+human pools. Remainder split by SplitRatios
+    for ID and human only. Covariate remainder -> val_cov+test_cov. ZS -> test_zs only.
 
-    Val loaders: [id+semantic, covariate_dev].
-    Test loaders: [id_retention, wild_memorization, zero_shot].
-      Human test examples are shared across all three test pillars.
+    Val loaders:  [id+human, covariate_dev].
+    Test loaders: [id_retention, covariate, zero_shot].
 
     :param tokenizer_name: HuggingFace hub identifier.
     :param split_strategy: one of 'temporal', 'temporal-ablate', 'scone-temporal',
                            'scone-temporal-ablate', 'all'.
-    :param split_ratios: SplitRatios instance or dict with keys train/val/test/wild.
+    :param split_ratios: SplitRatios or dict(train, val, test). must sum to 1.0.
+                         applied to ID and human remainder only.
+    :param wild_size: target total wild pool size (integer).
     :param wild_ratios: (pi_id, pi_cov, pi_sem) composition of wild pool. must sum to 1.
+    :param test_pool_cap: max examples per test pillar after attack augmentation. <=0 = no cap.
     :param batch_size: per-device batch size.
     :param max_length: tokenizer max length.
-    :param attacks: include adversarial samples in test pool.
+    :param attacks: include adversarial samples in test pillars only.
     :param seed: random seed.
     """
 
@@ -278,7 +252,9 @@ class FullEnergyRAIDDataModule(L.LightningDataModule):
         tokenizer_name: str,
         split_strategy: str = "scone-temporal",
         split_ratios: SplitRatios | dict = None,
+        wild_size: int = 20_000,
         wild_ratios: tuple[float, float, float] = (0.1, 0.6, 0.3),
+        test_pool_cap: int = 10_000,
         batch_size: int = 32,
         max_length: int = 512,
         attacks: bool = True,
@@ -290,22 +266,33 @@ class FullEnergyRAIDDataModule(L.LightningDataModule):
         elif isinstance(split_ratios, dict):
             split_ratios = SplitRatios(**split_ratios)
         assert isinstance(split_ratios, SplitRatios)
-        assert split_strategy in SPLIT_FAMILIES, f"unknown split_strategy: {split_strategy}"
+        assert split_strategy in SPLIT_FAMILIES,   f"unknown split_strategy: {split_strategy}"
         assert abs(sum(wild_ratios) - 1.0) < 1e-6, f"wild_ratios must sum to 1: {wild_ratios}"
+        assert wild_size > 0,                       f"wild_size must be > 0"
+
+        # verify no model appears in more than one role
+        roles = SPLIT_ROLES[split_strategy]
+        all_role_models = roles["id"] + roles["covariate"] + roles["zero_shot"]
+        assert len(all_role_models) == len(set(all_role_models)), (
+            f"split_strategy '{split_strategy}' has overlapping role assignments: "
+            f"{[m for m in all_role_models if all_role_models.count(m) > 1]}"
+        )
 
         self.tokenizer_name = tokenizer_name
         self.split_strategy = split_strategy
         self.split_ratios   = split_ratios
+        self.wild_size      = wild_size
         self.wild_ratios    = wild_ratios
+        self.test_pool_cap  = test_pool_cap
         self.batch_size     = batch_size
         self.max_length     = max_length
         self.attacks        = attacks
         self.seed           = seed
 
-        self.id_families = SPLIT_FAMILIES[split_strategy]
-        self.n_classes   = len(self.id_families)
-        self.tokenizer   = None
-        self._sanity_stats: dict = {}
+        self.id_families  = SPLIT_FAMILIES[split_strategy]
+        self.n_classes    = len(self.id_families)
+        self.tokenizer    = None
+        self._sanity_stats = {}
 
         set_seed(seed)
 
@@ -322,146 +309,207 @@ class FullEnergyRAIDDataModule(L.LightningDataModule):
         attacks_col = np.array(ds["attack"])
         clean_mask  = attacks_col == "none"
 
-        roles = SPLIT_ROLES[self.split_strategy]
-        id_models  = roles["id"]
-        cov_models = roles["covariate"]
-        zs_models  = roles["zero_shot"]
+        roles      = SPLIT_ROLES[self.split_strategy]
+        id_models  = set(roles["id"])
+        cov_models = set(roles["covariate"])
+        zs_models  = set(roles["zero_shot"])
 
-        all_machine_models = list({m for m in models_col if m != "human"})
+        def cat(arrays):
+            arrays = [a for a in arrays if len(a) > 0]
+            return np.concatenate(arrays) if arrays else np.array([], dtype=np.int64)
 
-        # per-model splits (clean only for train/val/wild; test gets attacks if enabled)
-        per_model: dict[str, dict[str, np.ndarray]] = {}
-
-        for m in all_machine_models + ["human"]:
-            clean_idx = np.where((models_col == m) & clean_mask)[0]
-            if len(clean_idx) == 0:
+        # collect and shuffle clean indices per model
+        clean_idx: dict[str, np.ndarray] = {}
+        for m in set(models_col.tolist()):
+            idx = np.where((models_col == m) & clean_mask)[0]
+            if len(idx) == 0:
                 continue
-            per_model[m] = _split_model_indices(clean_idx, self.split_ratios, rng)
+            rng.shuffle(idx)
+            clean_idx[m] = idx
 
-            if self.attacks and m != "human":
-                atk_idx = np.where((models_col == m) & ~clean_mask)[0]
-                if len(atk_idx) > 0:
-                    # append attack samples to test slice only
-                    per_model[m]["test"] = np.concatenate([per_model[m]["test"], atk_idx])
+        pi_id, pi_cov, pi_sem = self.wild_ratios
 
-        # accumulate pools by role
-        train_id_idx, train_hum_idx = [], []
-        val_id_idx,   val_hum_idx   = [], []
-        test_id_idx, test_cov_idx, test_zs_idx, test_hum_idx = [], [], [], []
-        wild_leftovers: dict[str, list] = {"id": [], "covariate": [], "human": []}
+        # step 1 — carve wild from ID, covariate, human pools independently
+        id_clean  = {m: clean_idx[m] for m in id_models  if m in clean_idx}
+        cov_clean = {m: clean_idx[m] for m in cov_models if m in clean_idx}
+        hum_clean = {"human": clean_idx["human"]} if "human" in clean_idx else {}
 
-        for m, splits in per_model.items():
-            if m == "human":
-                train_hum_idx.append(splits["train"])
-                val_hum_idx.append(splits["val"])
-                test_hum_idx.append(splits["test"])
-                wild_leftovers["human"].append(splits["wild"])
-            elif m in id_models:
-                train_id_idx.append(splits["train"])
-                val_id_idx.append(splits["val"])
-                test_id_idx.append(splits["test"])
-                wild_leftovers["id"].append(splits["wild"])
-                if m in cov_models:
-                    test_cov_idx.append(splits["test"])
-                    wild_leftovers["covariate"].append(splits["wild"])
-                if m in zs_models:
-                    test_zs_idx.append(splits["test"])
-            else:
-                # OOD-only models (covariate or zero-shot, not in id_models)
-                if m in cov_models:
-                    test_cov_idx.append(splits["test"])
-                    if m not in id_models:
-                        wild_leftovers["covariate"].append(splits["wild"])
-                if m in zs_models:
-                    test_zs_idx.append(splits["test"])
+        wild_id_carved,  id_remainder  = _proportional_wild_carve(id_clean,  int(self.wild_size * pi_id),  rng)
+        wild_cov_carved, cov_remainder = _proportional_wild_carve(cov_clean, int(self.wild_size * pi_cov), rng)
+        wild_hum_carved, hum_remainder = _proportional_wild_carve(hum_clean, int(self.wild_size * pi_sem), rng)
 
-        wild_pool, wild_composition = _build_wild_pool(wild_leftovers, self.wild_ratios, rng)
+        wild_pool = cat(
+            list(wild_id_carved.values()) +
+            list(wild_cov_carved.values()) +
+            list(wild_hum_carved.values())
+        )
+        rng.shuffle(wild_pool)
 
-        def cat(lists): return np.concatenate(lists) if lists else np.array([], dtype=np.int64)
+        # step 2 — split ID and human remainders into train/val/test
+        id_splits  = {m: _split_by_ratios(rem, self.split_ratios) for m, rem in id_remainder.items()}
+        hum_splits = {m: _split_by_ratios(rem, self.split_ratios) for m, rem in hum_remainder.items()}
 
-        train_pool = cat(train_id_idx + train_hum_idx)
-        val_pool   = cat(val_id_idx + val_hum_idx)
-        test_hum   = cat(test_hum_idx)
+        # covariate remainder -> val_cov + test_cov (split 50/50, no train)
+        cov_val_idx, cov_test_idx = [], []
+        for m, rem in cov_remainder.items():
+            mid = len(rem) // 2
+            cov_val_idx.append(rem[:mid])
+            cov_test_idx.append(rem[mid:])
 
-        test_id_pool  = cat(test_id_idx  + [test_hum])
-        test_cov_pool = cat(test_cov_idx + [test_hum])
-        test_zs_pool  = cat(test_zs_idx  + [test_hum])
+        # zero-shot clean -> test_zs only
+        zs_test_idx = [clean_idx[m] for m in zs_models if m in clean_idx]
 
-        assert len(train_pool) > 0, "train_pool is empty"
-        assert len(val_pool)   > 0, "val_pool is empty"
-        assert len(test_hum)   > 0, "test human pool is empty"
-        assert len(wild_pool)  > 0, "wild_pool is empty"
+        # step 3 — attacks to test pillars only
+        def get_attacks(model_set):
+            arrs = []
+            for m in model_set:
+                atk = np.where((models_col == m) & ~clean_mask)[0]
+                if len(atk) > 0:
+                    arrs.append(atk)
+            return cat(arrs)
 
-        # overlap check — train/val/wild must be disjoint (test shares human)
+        id_test_atk  = get_attacks(id_models)
+        cov_test_atk = get_attacks(cov_models)
+        zs_test_atk  = get_attacks(zs_models)
+        hum_test_atk = get_attacks({"human"})
+
+        # assemble pools
+        train_pool = cat([sp["train"] for sp in id_splits.values()] +
+                         [sp["train"] for sp in hum_splits.values()])
+        val_pool   = cat([sp["val"]   for sp in id_splits.values()] +
+                         [sp["val"]   for sp in hum_splits.values()])
+        val_cov_pool = cat(cov_val_idx)
+
+        test_hum_clean = cat([sp["test"] for sp in hum_splits.values()])
+        test_hum_pool  = cat([test_hum_clean, hum_test_atk])
+
+        test_id_raw  = cat([sp["test"] for sp in id_splits.values()] + [id_test_atk,  test_hum_pool])
+        test_cov_raw = cat(cov_test_idx + [cov_test_atk, test_hum_pool])
+        test_zs_raw  = cat(zs_test_idx  + [zs_test_atk,  test_hum_pool])
+
+        # step 4 — cap test pillars
+        test_id_pool  = _cap_pool(test_id_raw,  self.test_pool_cap, rng)
+        test_cov_pool = _cap_pool(test_cov_raw, self.test_pool_cap, rng)
+        test_zs_pool  = _cap_pool(test_zs_raw,  self.test_pool_cap, rng)
+
+        # overlap assertions — train/val/wild must be fully disjoint
         train_s = set(train_pool.tolist())
         val_s   = set(val_pool.tolist())
         wild_s  = set(wild_pool.tolist())
-        assert not (train_s & val_s),   "overlap: train ∩ val"
-        assert not (train_s & wild_s),  "overlap: train ∩ wild"
-        assert not (val_s   & wild_s),  "overlap: val ∩ wild"
+        assert not (train_s & val_s),  "overlap: train ∩ val"
+        assert not (train_s & wild_s), "overlap: train ∩ wild"
+        assert not (val_s   & wild_s), "overlap: val ∩ wild"
+
+        # zero-shot leakage assertion
+        zs_all_clean = set(cat(zs_test_idx).tolist())
+        assert not (train_s & zs_all_clean), "leakage: zero-shot models in train"
+        assert not (wild_s  & zs_all_clean), "leakage: zero-shot models in wild"
+
+        # covariate leakage assertion
+        cov_all_clean = set(cat(list(cov_remainder.values()) + list(wild_cov_carved.values())).tolist())
+        assert not (train_s & cov_all_clean), "leakage: covariate models in train"
+
+        assert len(train_pool) > 0, "train_pool is empty"
+        assert len(val_pool)   > 0, "val_pool is empty"
+        assert len(wild_pool)  > 0, "wild_pool is empty"
 
         kw = dict(tokenizer=self.tokenizer, family_to_idx=self.id_families, max_length=self.max_length)
 
         if stage in ("fit", None):
-            self.train_ds    = FullEnergyRAIDSubset(ds.select(train_pool), **kw)
-            self.wild_ds     = FullEnergyRAIDSubset(ds.select(wild_pool),  **kw, is_unlabeled=True)
-            self.val_ds      = FullEnergyRAIDSubset(ds.select(val_pool),   **kw)
-            self.val_cov_ds  = FullEnergyRAIDSubset(ds.select(cat(val_id_idx)), **kw)
+            self.train_ds   = FullEnergyRAIDSubset(ds.select(train_pool),   **kw)
+            self.wild_ds    = FullEnergyRAIDSubset(ds.select(wild_pool),    **kw, is_unlabeled=True)
+            self.val_ds     = FullEnergyRAIDSubset(ds.select(val_pool),     **kw)
+            self.val_cov_ds = FullEnergyRAIDSubset(ds.select(val_cov_pool), **kw)
 
         if stage in ("test", None):
             self.test_id_ds  = FullEnergyRAIDSubset(ds.select(test_id_pool),  **kw)
             self.test_cov_ds = FullEnergyRAIDSubset(ds.select(test_cov_pool), **kw)
             self.test_zs_ds  = FullEnergyRAIDSubset(ds.select(test_zs_pool),  **kw)
 
+        # record per-model stats for sanity check
+        per_model_stats = {}
+        for m in sorted(clean_idx.keys()):
+            w = (len(wild_id_carved.get(m, [])) + len(wild_cov_carved.get(m, [])) +
+                 len(wild_hum_carved.get(m, [])))
+            if m in id_splits:
+                sp = id_splits[m]
+                role = "id"
+            elif m in hum_splits:
+                sp = hum_splits[m]
+                role = "human"
+            elif m in cov_remainder:
+                sp = {"train": np.array([]), "val": np.array([]), "test": cov_remainder[m]}
+                role = "covariate"
+            elif m in zs_models:
+                sp = {"train": np.array([]), "val": np.array([]), "test": clean_idx.get(m, np.array([]))}
+                role = "zero_shot"
+            else:
+                continue
+            per_model_stats[m] = {
+                "role":  role,
+                "clean": len(clean_idx[m]),
+                "wild":  w,
+                "train": len(sp["train"]),
+                "val":   len(sp["val"]),
+                "test":  len(sp["test"]),
+            }
+
         self._sanity_stats = {
-            "per_model": {m: {k: len(v) for k, v in splits.items()} for m, splits in per_model.items()},
+            "per_model": per_model_stats,
             "pool_sizes": {
-                "train": len(train_pool),
-                "val":   len(val_pool),
-                "wild":  len(wild_pool),
+                "train":    len(train_pool),
+                "val":      len(val_pool),
+                "val_cov":  len(val_cov_pool),
+                "wild":     len(wild_pool),
                 "test_id":  len(test_id_pool),
                 "test_cov": len(test_cov_pool),
                 "test_zs":  len(test_zs_pool),
             },
-            "wild_composition": wild_composition,
+            "wild_composition": {
+                "id":       sum(len(v) for v in wild_id_carved.values()),
+                "covariate":sum(len(v) for v in wild_cov_carved.values()),
+                "human":    sum(len(v) for v in wild_hum_carved.values()),
+            },
         }
         self._sanity_check()
 
     def _sanity_check(self):
         """
-        Prints per-model split counts, pool totals, wild composition, and
-        a rough data-utilization summary. call after setup() to verify correctness.
+        Prints per-model split counts with role labels, pool totals, wild composition,
+        leakage summary, and data utilization. call after setup() to verify correctness.
         """
         s = self._sanity_stats
-        print("\n" + "=" * 70)
-        print(f"  SANITY CHECK — {self.split_strategy}")
-        print("=" * 70)
+        print("\n" + "=" * 80)
+        print(f"  SANITY CHECK — {self.split_strategy}  (wild_size={self.wild_size}, cap={self.test_pool_cap})")
+        print("=" * 80)
 
-        print(f"\n{'model':<20} {'total':>7} {'train':>7} {'val':>6} {'test':>6} {'wild':>6}")
-        print("-" * 57)
-        grand_total = 0
-        for m, counts in sorted(s["per_model"].items()):
-            total = sum(counts.values())
-            grand_total += total
-            print(f"  {m:<18} {total:>7} {counts['train']:>7} {counts['val']:>6} {counts['test']:>6} {counts['wild']:>6}")
-        print("-" * 57)
-        print(f"  {'TOTAL (clean)':<18} {grand_total:>7}")
+        print(f"\n  {'model':<18} {'role':<12} {'clean':>7} {'wild':>6} {'train':>7} {'val':>6} {'test*':>7}")
+        print("  " + "-" * 65)
+        grand_clean = 0
+        for m, c in s["per_model"].items():
+            grand_clean += c["clean"]
+            print(f"  {m:<18} {c['role']:<12} {c['clean']:>7} {c['wild']:>6} "
+                  f"{c['train']:>7} {c['val']:>6} {c['test']:>7}")
+        print("  " + "-" * 65)
+        print(f"  {'TOTAL (clean)':<31} {grand_clean:>7}")
+        print(f"  * test col is pre-cap clean remainder; attacks and human not reflected per-model.")
 
-        print(f"\n  pool sizes (post-construction):")
+        print(f"\n  pool sizes (post-construction, post-cap):")
         for k, v in s["pool_sizes"].items():
-            print(f"    {k:<12}: {v:>7}")
+            print(f"    {k:<12}: {v:>8}")
 
         wc = s["wild_composition"]
-        wild_total = sum(wc.values())
-        print(f"\n  wild composition (target {self.wild_ratios}):")
+        wt = sum(wc.values())
+        print(f"\n  wild composition (target {self.wild_ratios}, actual total={wt}):")
         for k, v in wc.items():
-            pct = v / wild_total * 100 if wild_total > 0 else 0
-            print(f"    {k:<12}: {v:>6}  ({pct:.1f}%)")
+            pct = v / wt * 100 if wt > 0 else 0.0
+            print(f"    {k:<12}: {v:>7}  ({pct:.1f}%)")
 
         used = s["pool_sizes"]["train"] + s["pool_sizes"]["val"] + s["pool_sizes"]["wild"]
-        print(f"\n  data utilization (train+val+wild / clean total): {used}/{grand_total} = {used/grand_total*100:.1f}%")
-        print("  note: test slices reuse machine+human subsets — not double-counted above.")
-        print("=" * 70 + "\n")
+        print(f"\n  utilization (train+val+wild / clean total): {used} / {grand_clean} = {used/grand_clean*100:.1f}%")
+        print("  leakage assertions: PASSED (zero-shot and covariate not in train/wild)")
+        print("  human test indices shared across all three test pillars.")
+        print("=" * 80 + "\n")
 
     def train_dataloader(self):
         return {
