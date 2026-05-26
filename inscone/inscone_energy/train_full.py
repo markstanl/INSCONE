@@ -1,7 +1,6 @@
 """
-Training loop for SCONE-extended energy-based MGT detector.
-Best checkpoint selected by lowest proxy FPR95 on dev_cov vs val_sem.
-Wild fraction diagnostic validates η: ~pi_s of wild should have E > 0.
+Training loop for SCONE-extended energy-based MGT detector using full dataset.
+Swaps EnergyRAIDDataModule → FullEnergyRAIDDataModule; all other logic identical.
 """
 
 import argparse
@@ -11,10 +10,9 @@ from tqdm import tqdm
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from lightning.fabric.strategies import DDPStrategy
-from torchmetrics.functional.classification import binary_roc
 
 from inscone.inscone_energy.model import INSCONEEnergyDetector, SCONEEnergyDetector
-from baseline.energy.datamodule import EnergyRAIDDataModule
+from energy.full_datamodule import FullEnergyRAIDDataModule, SplitRatios
 from baseline.energy.test import test
 from baseline.energy.dev import _log_energy_diagnostics, _log_per_model_energy
 
@@ -37,37 +35,31 @@ def train(
     scone_warmup_epochs: int = 2,
     freeze_embedding_layer: bool = True,
     devices: int = 1,
-    train_id_budget: int = 10_000,
-    wild_budget: int = 10_000,
+    split_ratios: SplitRatios | dict = None,
     wild_ratios: tuple[float, float, float] = (0.1, 0.6, 0.3),
-    eval_budget: int = 5_000,
-    dev_budget: int = 5_000,
-    test_budget: int = 5_000,
     attacks: bool = True,
     buffer: float = 0.0,
     seed: int = 42,
     silent: bool = False,
-    checkpoint_name: str = "scone_energy",
-    budget_multiplier: float = 1.0,
-    model: str = "inscone",
+    checkpoint_name: str = "scone_energy_full",
+    model_type: str = "inscone",
 ) -> None:
     """
-    :param split_strategy: use 'scone-temporal' for proper covariate/zero-shot structure.
-    :param m_in: η, energy margin for labeled ID. validate via wild frac diagnostic.
-    :param m_out: energy margin for labeled OOD (human).
+    :param split_strategy: one of 'scone-temporal', 'scone-temporal-ablate', 'all'.
+    :param split_ratios: SplitRatios or dict with keys train/val/test/wild. defaults to 85/5/5/5.
+    :param wild_ratios: (π_id, π_c, π_s) composition of wild pool.
+    :param m_in: η — energy margin for labeled ID samples.
+    :param m_out: energy margin for labeled OOD (human) samples.
     :param lambda_scone: weight for wild margin loss.
-    :param wild_ratios: (π_id, π_c, π_s). pi_s = wild_ratios[2] used for diagnostics.
     :param scone_warmup_epochs: epochs before wild loss activates.
-    :param silent: suppress all per-step and per-epoch diagnostics; only print test table.
+    :param model_type: 'inscone' or 'scone'.
+    :param silent: suppress per-step diagnostics; only print test table.
     :param checkpoint_name: base name for saved checkpoints.
-    :param budget_multiplier: uniform scale factor for all budget params (train_id, wild, eval, dev, test).
     """
-    # apply multiplier uniformly — easy scaling without touching individual params
-    train_id_budget = int(train_id_budget * budget_multiplier)
-    wild_budget     = int(wild_budget     * budget_multiplier)
-    eval_budget     = int(eval_budget     * budget_multiplier)
-    dev_budget      = int(dev_budget      * budget_multiplier)
-    test_budget     = int(test_budget     * budget_multiplier)
+    if split_ratios is None:
+        split_ratios = SplitRatios()
+    elif isinstance(split_ratios, dict):
+        split_ratios = SplitRatios(**split_ratios)
 
     torch.set_float32_matmul_precision("medium")
 
@@ -80,29 +72,26 @@ def train(
     fabric.launch()
     fabric.print(
         f"config | split={split_strategy} lambda_scone={lambda_scone} "
-        f"m_in={m_in} m_out={m_out} seed={seed} budget_mult={budget_multiplier}\n"
-        f"  budgets | train_id={train_id_budget} wild={wild_budget} "
-        f"eval={eval_budget} dev={dev_budget} test={test_budget}"
+        f"m_in={m_in} m_out={m_out} seed={seed}\n"
+        f"  split_ratios | train={split_ratios.train} val={split_ratios.val} "
+        f"test={split_ratios.test} wild={split_ratios.wild}\n"
+        f"  wild_ratios  | {wild_ratios}"
     )
 
-    dm = EnergyRAIDDataModule(
+    dm = FullEnergyRAIDDataModule(
         tokenizer_name=tokenizer_name,
         split_strategy=split_strategy,
-        train_id_budget=train_id_budget,
-        wild_budget=wild_budget,
-        eval_budget=eval_budget,
-        dev_budget=dev_budget,
-        test_budget=test_budget,
+        split_ratios=split_ratios,
+        wild_ratios=wild_ratios,
         batch_size=batch_size_per_gpu,
         attacks=attacks,
         seed=seed,
-        wild_ratios=wild_ratios
     )
     dm.prepare_data()
     dm.setup(stage="fit")
     dm.setup(stage="test")
 
-    ModelCls = INSCONEEnergyDetector if args.model == "inscone" else SCONEEnergyDetector
+    ModelCls = INSCONEEnergyDetector if model_type == "inscone" else SCONEEnergyDetector
 
     model = ModelCls(
         model_name=tokenizer_name,
@@ -137,17 +126,17 @@ def train(
     model.mark_forward_method("compute_loss")
     model.mark_forward_method("compute_energy")
 
-    raw_loaders = dm.train_dataloader()
-    id_loader   = fabric.setup_dataloaders(raw_loaders["id"])
-    wild_loader = fabric.setup_dataloaders(raw_loaders["wild"], use_distributed_sampler=False)
+    raw_loaders       = dm.train_dataloader()
+    id_loader         = fabric.setup_dataloaders(raw_loaders["id"])
+    wild_loader       = fabric.setup_dataloaders(raw_loaders["wild"], use_distributed_sampler=False)
     val_id_sem_loader = fabric.setup_dataloaders(dm.val_dataloader()[0])
 
     num_batches = len(id_loader)
     total_steps = epochs * num_batches - warmup_steps
-    scheduler = CosineAnnealingLR(optimizer, T_max=max(total_steps, 1), eta_min=learning_rate / 10)
+    scheduler   = CosineAnnealingLR(optimizer, T_max=max(total_steps, 1), eta_min=learning_rate / 10)
 
     diag_interval = max(1, num_batches // 3)
-    wild_iter = iter(wild_loader)
+    wild_iter     = iter(wild_loader)
 
     for epoch in range(epochs):
         model.train()
@@ -171,7 +160,7 @@ def train(
             optimizer.zero_grad()
             loss, l_con, l_cls, l_eng, l_scone = model.compute_loss(
                 id_batch["tokens"], id_batch["mask"],
-                id_batch["label"], id_batch["family_idx"],
+                id_batch["label"],  id_batch["family_idx"],
                 wild_tokens=wild_batch["tokens"], wild_mask=wild_batch["mask"],
             )
 
@@ -220,8 +209,8 @@ def train(
 
             if not silent:
                 fabric.print(
-                    f"  energy | id: {e_id_all.mean():.3f} +/- {e_id_all.std():.3f} "
-                    f"| ood_sem: {e_ood_all.mean():.3f} +/- {e_ood_all.std():.3f}"
+                    f"  energy | id: {e_id_all.mean():.3f} ± {e_id_all.std():.3f} "
+                    f"| ood_sem: {e_ood_all.mean():.3f} ± {e_ood_all.std():.3f}"
                 )
 
             emp_thresh = torch.quantile(e_id_all.float(), 0.95) if len(e_id_all) > 0 else torch.tensor(0.0)
@@ -240,37 +229,32 @@ def train(
 
 
 def _parse_args():
-    p = argparse.ArgumentParser(description="SCONE energy MGT detector training")
-    p.add_argument("--tokenizer",        default="princeton-nlp/unsup-simcse-roberta-base")
-    p.add_argument("--split",            default="scone-temporal",
+    p = argparse.ArgumentParser(description="SCONE energy MGT detector — full dataset training")
+    p.add_argument("--tokenizer",       default="princeton-nlp/unsup-simcse-roberta-base")
+    p.add_argument("--split",           default="scone-temporal",
                    choices=["scone-temporal", "scone-temporal-ablate", "all"])
-    p.add_argument("--epochs",           type=int,   default=20)
-    p.add_argument("--batch_size",       type=int,   default=32)
-    p.add_argument("--lr",               type=float, default=2e-5)
-    p.add_argument("--warmup_steps",     type=int,   default=2000)
-    p.add_argument("--alpha_energy",     type=float, default=0.001)
-    p.add_argument("--lambda_scone",     type=float, default=0.01)
-    p.add_argument("--m_in",             type=float, default=-7.0)
-    p.add_argument("--m_out",            type=float, default=-2.0)
-    p.add_argument("--scone_warmup",     type=int,   default=4)
-    p.add_argument("--wild_ratios",      type=float, nargs=3, default=[0.1, 0.6, 0.3],
+    p.add_argument("--epochs",          type=int,   default=20)
+    p.add_argument("--batch_size",      type=int,   default=32)
+    p.add_argument("--lr",              type=float, default=2e-5)
+    p.add_argument("--warmup_steps",    type=int,   default=2000)
+    p.add_argument("--alpha_energy",    type=float, default=0.001)
+    p.add_argument("--lambda_scone",    type=float, default=0.01)
+    p.add_argument("--m_in",            type=float, default=-7.0)
+    p.add_argument("--m_out",           type=float, default=-2.0)
+    p.add_argument("--scone_warmup",    type=int,   default=4)
+    p.add_argument("--wild_ratios",     type=float, nargs=3, default=[0.1, 0.6, 0.3],
                    metavar=("PI_ID", "PI_C", "PI_S"))
-    p.add_argument("--buffer",           type=float, default=0.1)
-    p.add_argument("--train_id_budget",  type=int,   default=10_000)
-    p.add_argument("--wild_budget",      type=int,   default=10_000)
-    p.add_argument("--eval_budget",      type=int,   default=1_000)
-    p.add_argument("--dev_budget",       type=int,   default=5_000)
-    p.add_argument("--test_budget",      type=int,   default=5_000)
-    p.add_argument("--budget_multiplier",type=float, default=1.0,
-                   help="Uniform scale factor for all budget params")
-    p.add_argument("--devices",          type=int,   default=1)
-    p.add_argument("--seed",             type=int,   default=42)
-    p.add_argument("--silent",           action="store_true")
-    p.add_argument("--no_attacks",       action="store_true")
-    p.add_argument("--checkpoint_name",  default="scone_energy")
-    p.add_argument("--model", type=str, default="inscone",
-                    choices=["inscone", "scone"],
-                    help="model architecture: inscone (pi-SCONE) or scone (uniform push)")
+    p.add_argument("--buffer",          type=float, default=0.1)
+    p.add_argument("--train_ratio",     type=float, default=0.85)
+    p.add_argument("--val_ratio",       type=float, default=0.05)
+    p.add_argument("--test_ratio",      type=float, default=0.05)
+    p.add_argument("--wild_ratio",      type=float, default=0.05)
+    p.add_argument("--devices",         type=int,   default=1)
+    p.add_argument("--seed",            type=int,   default=42)
+    p.add_argument("--silent",          action="store_true")
+    p.add_argument("--no_attacks",      action="store_true")
+    p.add_argument("--checkpoint_name", default="scone_energy_full")
+    p.add_argument("--model",           default="inscone", choices=["inscone", "scone"])
     return p.parse_args()
 
 
@@ -290,16 +274,16 @@ if __name__ == "__main__":
         scone_warmup_epochs=args.scone_warmup,
         wild_ratios=tuple(args.wild_ratios),
         buffer=args.buffer,
-        train_id_budget=args.train_id_budget,
-        wild_budget=args.wild_budget,
-        eval_budget=args.eval_budget,
-        dev_budget=args.dev_budget,
-        test_budget=args.test_budget,
-        budget_multiplier=args.budget_multiplier,
+        split_ratios=SplitRatios(
+            train=args.train_ratio,
+            val=args.val_ratio,
+            test=args.test_ratio,
+            wild=args.wild_ratio,
+        ),
         devices=args.devices,
         seed=args.seed,
         silent=args.silent,
         attacks=not args.no_attacks,
         checkpoint_name=args.checkpoint_name,
-        model=args.model
+        model_type=args.model,
     )

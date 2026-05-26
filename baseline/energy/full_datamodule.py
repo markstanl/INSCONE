@@ -370,7 +370,8 @@ class FullEnergyRAIDDataModule(L.LightningDataModule):
                 # OOD-only models (covariate or zero-shot, not in id_models)
                 if m in cov_models:
                     test_cov_idx.append(splits["test"])
-                    wild_leftovers["covariate"].append(splits["wild"])
+                    if m not in id_models:
+                        wild_leftovers["covariate"].append(splits["wild"])
                 if m in zs_models:
                     test_zs_idx.append(splits["test"])
 
