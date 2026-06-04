@@ -12,7 +12,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from lightning.fabric.strategies import DDPStrategy
 
 from inscone.inscone_energy.model import INSCONEEnergyDetector, SCONEEnergyDetector
-from energy.full_datamodule import FullEnergyRAIDDataModule, SplitRatios
+from baseline.energy.full_datamodule import FullEnergyRAIDDataModule, SplitRatios
 from baseline.energy.test import test
 from baseline.energy.dev import _log_energy_diagnostics, _log_per_model_energy
 
@@ -38,7 +38,9 @@ def train(
     freeze_embedding_layer: bool = True,
     devices: int = 1,
     split_ratios: SplitRatios | dict = None,
+    wild_size: int = 20_000,
     wild_ratios: tuple[float, float, float] = (0.1, 0.6, 0.3),
+    test_pool_cap: int = 10_000,
     attacks: bool = True,
     buffer: float = 0.0,
     seed: int = 42,
@@ -48,8 +50,10 @@ def train(
 ) -> None:
     """
     :param split_strategy: one of 'scone-temporal', 'scone-temporal-ablate', 'all'.
-    :param split_ratios: SplitRatios or dict with keys train/val/test/wild. defaults to 85/5/5/5.
+    :param split_ratios: SplitRatios or dict with keys train/val/test. must sum to 1.0.
+    :param wild_size: target total wild pool size (integer).
     :param wild_ratios: (π_id, π_c, π_s) composition of wild pool.
+    :param test_pool_cap: max examples per test pillar after attack augmentation.
     :param m_in: η — energy margin for labeled ID samples.
     :param m_out: energy margin for labeled OOD (human) samples.
     :param m_in_wild: energy target for proximal wild samples. defaults to m_in.
@@ -77,16 +81,17 @@ def train(
     fabric.print(
         f"config | split={split_strategy} lambda_scone={lambda_scone} "
         f"m_in={m_in} m_out={m_out} seed={seed}\n"
-        f"  split_ratios | train={split_ratios.train} val={split_ratios.val} "
-        f"test={split_ratios.test} wild={split_ratios.wild}\n"
-        f"  wild_ratios  | {wild_ratios}"
+        f"  split_ratios | train={split_ratios.train} val={split_ratios.val} test={split_ratios.test}\n"
+        f"  wild_size={wild_size}  wild_ratios={wild_ratios}  test_pool_cap={test_pool_cap}"
     )
 
     dm = FullEnergyRAIDDataModule(
         tokenizer_name=tokenizer_name,
         split_strategy=split_strategy,
         split_ratios=split_ratios,
+        wild_size=wild_size,
         wild_ratios=wild_ratios,
+        test_pool_cap=test_pool_cap,
         batch_size=batch_size_per_gpu,
         attacks=attacks,
         seed=seed,
@@ -252,11 +257,12 @@ def _parse_args():
     p.add_argument("--scone_warmup",    type=int,   default=4)
     p.add_argument("--wild_ratios",     type=float, nargs=3, default=[0.1, 0.6, 0.3],
                    metavar=("PI_ID", "PI_C", "PI_S"))
+    p.add_argument("--wild_size",       type=int,   default=20_000)
+    p.add_argument("--test_pool_cap",   type=int,   default=10_000)
     p.add_argument("--buffer",          type=float, default=0.1)
-    p.add_argument("--train_ratio",     type=float, default=0.85)
+    p.add_argument("--train_ratio",     type=float, default=0.90)
     p.add_argument("--val_ratio",       type=float, default=0.05)
     p.add_argument("--test_ratio",      type=float, default=0.05)
-    p.add_argument("--wild_ratio",      type=float, default=0.05)
     p.add_argument("--devices",         type=int,   default=1)
     p.add_argument("--seed",            type=int,   default=42)
     p.add_argument("--silent",          action="store_true")
@@ -283,12 +289,13 @@ if __name__ == "__main__":
         m_out_wild=args.m_out_wild,
         scone_warmup_epochs=args.scone_warmup,
         wild_ratios=tuple(args.wild_ratios),
+        wild_size=args.wild_size,
+        test_pool_cap=args.test_pool_cap,
         buffer=args.buffer,
         split_ratios=SplitRatios(
             train=args.train_ratio,
             val=args.val_ratio,
             test=args.test_ratio,
-            wild=args.wild_ratio,
         ),
         devices=args.devices,
         seed=args.seed,
