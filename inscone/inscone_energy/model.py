@@ -143,6 +143,11 @@ class INSCONEEnergyDetector(SCONEEnergyDetector):
     :param buffer: fraction of wild samples around the composition boundary
                    that receive no gradient. 0.0 = hard split at π_s boundary.
     :param wild_ratios: (π_id, π_c, π_s). π_s = wild_ratios[2].
+    :param m_in_wild: energy target for proximal (covariate) wild samples.
+                      defaults to m_in for consistency with supervised margin.
+    :param m_out_wild: energy target for distal (semantic OOD) wild samples.
+                       defaults to m_out for consistency with supervised margin.
+                       previously hardcoded to 0 via relu(-e)^2.
     """
     def __init__(
         self,
@@ -155,6 +160,8 @@ class INSCONEEnergyDetector(SCONEEnergyDetector):
         lambda_scone: float = 0.01,
         m_in: float = -5.0,
         m_out: float = -1.0,
+        m_in_wild: float | None = None,
+        m_out_wild: float | None = None,
         buffer: float = 0.0,
         scone_warmup_epochs: int = 2,
         wild_ratios: tuple[float] = (0.1, 0.6, 0.3),
@@ -173,6 +180,8 @@ class INSCONEEnergyDetector(SCONEEnergyDetector):
             scone_warmup_epochs=scone_warmup_epochs,
             wild_ratios=wild_ratios,
         )
+        self.m_in_wild  = m_in_wild  if m_in_wild  is not None else m_in
+        self.m_out_wild = m_out_wild if m_out_wild is not None else m_out
         self.tau_proximal = max(0.0, 1.0 - wild_ratios[2] - buffer / 2)
         self.tau_distal   = min(1.0, 1.0 - wild_ratios[2] + buffer / 2)
         assert self.tau_proximal <= self.tau_distal
@@ -191,7 +200,7 @@ class INSCONEEnergyDetector(SCONEEnergyDetector):
 
         loss = torch.tensor(0.0, device=e_wild.device)
         if proximal_mask.any():
-            loss = loss + F.relu(e_wild[proximal_mask] - self.m_in).pow(2).mean()
+            loss = loss + F.relu(e_wild[proximal_mask] - self.m_in_wild).pow(2).mean()
         if distal_mask.any():
-            loss = loss + F.relu(-e_wild[distal_mask]).pow(2).mean()
+            loss = loss + F.relu(self.m_out_wild - e_wild[distal_mask]).pow(2).mean()
         return loss

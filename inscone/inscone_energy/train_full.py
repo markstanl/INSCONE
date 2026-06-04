@@ -32,6 +32,8 @@ def train(
     lambda_scone: float = 0.01,
     m_in: float = -5.0,
     m_out: float = -1.0,
+    m_in_wild: float | None = None,
+    m_out_wild: float | None = None,
     scone_warmup_epochs: int = 2,
     freeze_embedding_layer: bool = True,
     devices: int = 1,
@@ -50,6 +52,8 @@ def train(
     :param wild_ratios: (π_id, π_c, π_s) composition of wild pool.
     :param m_in: η — energy margin for labeled ID samples.
     :param m_out: energy margin for labeled OOD (human) samples.
+    :param m_in_wild: energy target for proximal wild samples. defaults to m_in.
+    :param m_out_wild: energy target for distal wild samples. defaults to m_out.
     :param lambda_scone: weight for wild margin loss.
     :param scone_warmup_epochs: epochs before wild loss activates.
     :param model_type: 'inscone' or 'scone'.
@@ -103,6 +107,8 @@ def train(
         lambda_scone=lambda_scone,
         m_in=m_in,
         m_out=m_out,
+        m_in_wild=m_in_wild,
+        m_out_wild=m_out_wild,
         scone_warmup_epochs=scone_warmup_epochs,
         wild_ratios=wild_ratios,
         buffer=buffer,
@@ -241,6 +247,8 @@ def _parse_args():
     p.add_argument("--lambda_scone",    type=float, default=0.01)
     p.add_argument("--m_in",            type=float, default=-7.0)
     p.add_argument("--m_out",           type=float, default=-2.0)
+    p.add_argument("--m_in_wild",       type=float, default=None)
+    p.add_argument("--m_out_wild",      type=float, default=None)
     p.add_argument("--scone_warmup",    type=int,   default=4)
     p.add_argument("--wild_ratios",     type=float, nargs=3, default=[0.1, 0.6, 0.3],
                    metavar=("PI_ID", "PI_C", "PI_S"))
@@ -271,6 +279,8 @@ if __name__ == "__main__":
         lambda_scone=args.lambda_scone,
         m_in=args.m_in,
         m_out=args.m_out,
+        m_in_wild=args.m_in_wild,
+        m_out_wild=args.m_out_wild,
         scone_warmup_epochs=args.scone_warmup,
         wild_ratios=tuple(args.wild_ratios),
         buffer=args.buffer,
